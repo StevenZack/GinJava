@@ -1,6 +1,21 @@
+import static android.content.ContentValues.TAG;
+
+import android.util.Log;
+
 import java.io.*;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
+import java.net.URLDecoder;
+import java.net.URLEncoder;
+import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
+import java.nio.channels.ReadableByteChannel;
+import java.nio.channels.WritableByteChannel;
+import java.nio.file.Files;
 import java.util.*;
 
 public class Gin {
@@ -8,27 +23,45 @@ public class Gin {
     private volatile boolean isRunning = false;
     private ServerSocket serverSocket;
     private final Map<String, Map<String, Handler>> handlerMap = new HashMap<>();
+    private final Map<String, Map<String, Handler>> multiPathHandlerMap = new HashMap<>();
 
-    public Gin() {
+    private String cacheDir;
+    public Gin(String cacheDir) {
+        this.cacheDir = cacheDir;
+    }
 
+    public void getMultiple(String path, Handler handler) {
+        handleMultiFunc(Methods.get, path, handler);
+    }
+
+    public void handleMultiFunc(String method, String path, Handler handler) {
+        Map<String, Handler> v = multiPathHandlerMap.get(path);
+        if (v == null) {
+            v = new HashMap<>();
+            multiPathHandlerMap.put(path, v);
+        }
+        v.put(method, handler);
+    }
+
+    public void handleFunc(String method, String path, Handler handler) {
+        Map<String, Handler> v = handlerMap.get(path);
+        if (v == null) {
+            v = new HashMap<>();
+            handlerMap.put(path, v);
+        }
+        v.put(method, handler);
     }
 
     public void get(String path, Handler handler) {
-        Map<String, Handler> v = handlerMap.get(path);
-        if (v == null) {
-            v = new HashMap<>();
-            handlerMap.put(path, v);
-        }
-        v.put(Methods.get, handler);
+        handleFunc(Methods.get, path, handler);
     }
 
     public void post(String path, Handler handler) {
-        Map<String, Handler> v = handlerMap.get(path);
-        if (v == null) {
-            v = new HashMap<>();
-            handlerMap.put(path, v);
-        }
-        v.put(Methods.post, handler);
+        handleFunc(Methods.post, path, handler);
+    }
+
+    public void put(String path, Handler handler) {
+        handleFunc(Methods.put, path, handler);
     }
 
     public void listen(int port) {
@@ -36,13 +69,13 @@ public class Gin {
             try {
                 run(port);
             } catch (
-                    IOException e) {
+                IOException e) {
                 e.printStackTrace();
             }
         }).start();
     }
 
-    private void run(int port) throws IOException {
+    public void run(int port) throws IOException {
         serverSocket = new ServerSocket(port);
         isRunning = true;
         while (isRunning) {
@@ -60,12 +93,22 @@ public class Gin {
         }
     }
 
+    private boolean containsMultiplePath(String path) {
+        for (Map.Entry<String, Map<String, Handler>> m : multiPathHandlerMap.entrySet()) {
+            if (path.startsWith(m.getKey())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void serveHTTP(Socket socket) {
         Context context = null;
         try {
-            context = new Context(socket);
-            if (handlerMap.containsKey(context.request.requestURI)) {
-                Map<String, Handler> m = handlerMap.get(context.request.requestURI);
+            context = new Context(socket,cacheDir);
+            String path = context.request.path();
+            if (handlerMap.containsKey(path)) {
+                Map<String, Handler> m = handlerMap.get(path);
                 if (m != null) {
                     Handler h = m.get(context.request.method);
                     if (h != null) {
@@ -75,6 +118,25 @@ public class Gin {
                     }
                 } else {
                     context.notFound();
+                }
+            } else if (containsMultiplePath(path)) {
+                for (Map.Entry<String, Map<String, Handler>> entry : multiPathHandlerMap.entrySet()) {
+                    if (!path.startsWith(entry.getKey())) {
+                        continue;
+                    }
+                    // found it
+                    Map<String, Handler> m = entry.getValue();
+                    if (!m.containsKey(context.request.method)) {
+                        context.string(Status.methodNotAllowed, Status.getMessage(Status.methodNotAllowed));
+                        break;
+                    }
+
+                    // multiFunc
+                    Handler handler = m.get(context.request.method);
+                    if (handler != null) {
+                        handler.handle(context);
+                    }
+                    break;
                 }
             } else {
                 context.notFound();
@@ -89,6 +151,8 @@ public class Gin {
                 }
             }
         }
+
+        // close connection
         if (context != null) {
             try {
                 context.response.flushData();
@@ -99,6 +163,7 @@ public class Gin {
         }
     }
 
+
     // child classes
     public static class Context {
         public final Request request;
@@ -108,9 +173,10 @@ public class Gin {
         private final InputStream inputStream;
         private final OutputStream outputStream;
         private boolean bodyReadStarted = false;
-        private long bodyReadN = 0;
-
-        public Context(Socket socket) throws Exception {
+        private long bodyReadN = 0; // bytes left to read
+        private String cacheDir;
+        public Context(Socket socket,String cacheDir) throws Exception {
+            this.cacheDir = cacheDir;
             this.socket = socket;
             this.inputStream = socket.getInputStream();
             this.outputStream = socket.getOutputStream();
@@ -197,12 +263,44 @@ public class Gin {
         public void notFound() throws IOException {
             response.notFound();
         }
+
+        public void forbidden() throws IOException {
+            response.forbidden();
+        }
+
+        public void badRequest(String s) throws IOException {
+            response.badRequest(s);
+        }
+
+        public void header(String key, String value) {
+            response.headers.put(key, value);
+        }
+
+        public void readBodyToFile(String dst) throws IOException {
+            new File(StrX.subBeforeLast(dst, "/", "/")).mkdirs();
+            File file = new File(dst);
+            if (file.exists()) {
+                file.delete();
+            }
+            file.createNewFile();
+
+            FileOutputStream fileOutputStream = new FileOutputStream(file);
+            FileChannel fileChannel = fileOutputStream.getChannel();
+            ReadableByteChannel readableByteChannel = Channels.newChannel(inputStream);
+            fileChannel.transferFrom(readableByteChannel, 0, bodyReadN);
+            fileOutputStream.close();
+        }
+
+        public String bodyAsText() throws IOException {
+            return request.bodyAsText();
+        }
     }
 
     public static class Request {
         public String method;
         public String requestURI;
         public String proto;
+        public Map<String, String> searchMap;
 
         public Map<String, String> headers = new HashMap<>();
 
@@ -210,6 +308,32 @@ public class Gin {
 
         public Request() {
 
+        }
+
+        public String query(String key) {
+            if (searchMap == null) {
+                String search = StrX.subAfter(requestURI, "?", "");
+                searchMap = new HashMap<>();
+                if (!search.isEmpty()) {
+                    String[] ss = search.split("&");
+                    for (String s : ss) {
+                        String[] kv = s.split("=");
+                        if (kv.length != 2) {
+                            continue;
+                        }
+                        try {
+                            searchMap.put(kv[0], URLDecoder.decode(kv[1], "UTF-8"));
+                        } catch (UnsupportedEncodingException e) {
+                            e.printStackTrace();
+                        }
+                    }
+                }
+            }
+            String s = searchMap.get(key);
+            if (s == null) {
+                s = "";
+            }
+            return s;
         }
 
         public long getContentLength() {
@@ -223,6 +347,10 @@ public class Gin {
                 e.printStackTrace();
                 return -1;
             }
+        }
+
+        public String path() {
+            return StrX.subBeforeLast(requestURI, "?", requestURI);
         }
 
         public static Request readContext(Context context) throws Exception {
@@ -251,19 +379,240 @@ public class Gin {
             return req;
         }
 
+
+
         public String bodyAsText() throws IOException {
             return context.readStringUntil("\r\n\r\n", true);
         }
 
         public void bodyCopyToFile(String dst) throws IOException {
-            File fo = new File(dst);
-            if (fo.exists()) {
-                fo.delete();
+            context.readBodyToFile(dst);
+        }
+
+        public static class MultipartFormField {
+            public String filename;
+            public long length;
+            public String name;
+            public String value;
+            public File file;
+        }
+
+        public static class MultipartFormBody{
+            private File file;
+            private long nLeftToRead;
+            private BufferedReader bufferedReader;
+            public MultipartFormBody(String filePath) throws FileNotFoundException {
+                file = new File(filePath);
+                nLeftToRead = file.length();
+                bufferedReader = new BufferedReader(new FileReader(filePath));
             }
-            fo.createNewFile();
-            FileOutputStream outputStream = new FileOutputStream(fo);
-            context.readBytesUntil(outputStream, "\r\n\r\n".getBytes("UTF-8"));
-            outputStream.close();
+
+            public String readStringUntil(String sep,boolean excludeSep) throws IOException {
+                byte[] sepBytes = sep.getBytes("UTF-8");
+                ByteArrayOutputStream builder = new ByteArrayOutputStream();
+                readBytesUntil(builder, sep.getBytes("UTF-8"));
+                byte[] out = builder.toByteArray();
+
+                if (excludeSep) {
+                    if (StrX.bytesEndsWith(out, sepBytes)) {
+                        out = Arrays.copyOf(out, out.length - sepBytes.length);
+                    }
+                }
+                if (out.length == 0) {
+                    return "";
+                }
+                return new String(out, "UTF-8");
+            }
+
+            public void readBytesUntil(BufferedWriter outputStream,byte[] sep,boolean excludeSep) throws IOException {
+                byte[] window = new byte[sep.length];
+                int n = 0;
+                while (!StrX.bytesEquals(window, sep)) {
+                    int vi = bufferedReader.read();
+                    if (vi == -1) {
+                        break;
+                    }
+                    byte v = (byte) vi;
+                    if (!excludeSep) {
+                        outputStream.write(v);
+                    }
+
+                    nLeftToRead--;
+                    if (nLeftToRead <= 0) {
+                        break;
+                    }
+
+                    if (n < window.length) {
+                        window[n] = v;
+                        n++;
+                        continue;
+                    }
+
+                    if (excludeSep) {
+                        outputStream.write(window[0]);
+                    }
+                    for (int i = 0; i < window.length; i++) {
+                        if (i < window.length - 1) {
+                            window[i] = window[i + 1];
+                            continue;
+                        }
+                        window[i] = v;
+                    }
+                }
+            }
+
+            public void readBytesUntil(OutputStream outputStream,byte[] sep) throws IOException {
+                byte[] window = new byte[sep.length];
+                int n = 0;
+                while (!StrX.bytesEquals(window, sep)) {
+                    int vi = bufferedReader.read();
+                    if (vi == -1) {
+                        break;
+                    }
+                    byte v = (byte) vi;
+                    outputStream.write(v);
+
+                    nLeftToRead--;
+                    if (nLeftToRead <= 0) {
+                        break;
+                    }
+
+                    if (n < window.length) {
+                        window[n] = v;
+                        n++;
+                        continue;
+                    }
+
+                    for (int i = 0; i < window.length; i++) {
+                        if (i < window.length - 1) {
+                            window[i] = window[i + 1];
+                            continue;
+                        }
+                        window[i] = v;
+                    }
+                }
+            }
+
+            public void close() throws IOException {
+                bufferedReader.close();
+            }
+
+            public void delete(){
+                file.delete();
+            }
+        }
+
+        /**
+         ------WebKitFormBoundary1FcV3vleeUX7Akxe
+         Content-Disposition: form-data; name="file"; filename="不对.txt"
+         Content-Type: text/plain
+
+         qwe
+         sdwefr
+         ===
+
+         ------WebKitFormBoundary1FcV3vleeUX7Akxe
+         Content-Disposition: form-data; name="file"; filename="你好.txt"
+         Content-Type: text/plain
+
+         asd
+         qwe
+         ------WebKitFormBoundary1FcV3vleeUX7Akxe
+         Content-Disposition: form-data; name="username"
+
+         健康减肥
+         ------WebKitFormBoundary1FcV3vleeUX7Akxe--
+         * @return
+         * @throws Exception
+         */
+        public List<MultipartFormField> parseMultipartForm() throws Exception {
+            // boundary: multipart/form-data; boundary=----WebKitFormBoundaryq0y6gUYIaRVQsaSa
+            String s = headers.get("Content-Type");
+            if (s == null || !s.startsWith("multipart/form-data")) {
+                throw new Exception("invalid content-type for multipart/form-data: " + s);
+            }
+            Log.d(TAG, "parseMultipartForm: ");
+            String boundary = StrX.subAfter(s, "boundary=", "");
+            if (boundary == null || boundary.isEmpty()) {
+                throw new Exception("invalid content-type for multipart/form-data: " + s);
+            }
+
+            long l = getContentLength();
+            if (l == 0) {
+                throw new Exception("empty body, content length is 0");
+            }
+
+            boundary = "--" + boundary;
+
+            String bodyCacheFile = FileX.joinPath(context.cacheDir, boundary);
+            FileX.truncateFile(bodyCacheFile);
+            FileX.readInputStreamToFile(context.inputStream,l,bodyCacheFile);
+
+            MultipartFormBody reader = new MultipartFormBody(bodyCacheFile);
+            reader.readStringUntil(boundary, true);
+            List<MultipartFormField> list = new ArrayList<>();
+            while (true) {
+                String prefix=reader.readStringUntil("\r\n", true);
+                if (prefix != null && prefix.equals("--")) {
+                    break;
+                }
+
+                MultipartFormField field = new MultipartFormField();
+                //headers
+                String line;
+                while (!(line = reader.readStringUntil("\r\n",true)).isEmpty()) {
+                    if (line.startsWith("Content-Disposition")) {
+                        line = StrX.subAfter(line, "; ", "");
+                        String[] ss = line.split("; ");
+                        for (int i = 0; i < ss.length; i++) {
+                            String[] kv = ss[i].split("=");
+                            if (kv.length != 2) {
+                                continue;
+                            }
+                            if (kv[0].equals("name")) {
+                                field.name = StrX.trimBoth(kv[1], "\"");
+                            } else if (kv[0].equals("filename")) {
+                                field.filename = StrX.trimBoth(kv[1], "\"");
+                                field.filename = URLDecoder.decode(field.filename, "UTF-8");
+                            }
+                        }
+                        continue;
+                    }
+                    // content type
+                }
+
+                //body
+                if (field.filename == null || field.filename.isEmpty()) {
+                    field.value = reader.readStringUntil(boundary, true);
+                    list.add(field);
+                    continue;
+                }
+
+                String dst = FileX.joinPath(context.cacheDir, boundary + field.filename);
+                File fo = new File(dst);
+                if (fo.exists()) {
+                    fo.delete();
+                }
+                fo.createNewFile();
+                FileOutputStream fileOutputStream=new FileOutputStream(fo);
+                BufferedWriter bufferedWriter = new BufferedWriter(new OutputStreamWriter(fileOutputStream));
+                reader.readBytesUntil(bufferedWriter,("\r\n"+boundary).getBytes("UTF-8"),true);
+                bufferedWriter.flush();
+                bufferedWriter.close();
+                fileOutputStream.close();
+                field.file = fo;
+                field.length = fo.length();
+
+                list.add(field);
+            }
+            reader.close();
+            reader.delete();
+
+            return list;
+        }
+
+        public String getContentType() {
+            return headers.get(Headers.contentType);
         }
     }
 
@@ -274,7 +623,7 @@ public class Gin {
         public Map<String, String> headers = new HashMap<>();
 
         private ByteArrayOutputStream body;
-        private InputStream bodyInputStream;
+        private FileInputStream bodyInputStream;
 
         private final Context context;
 
@@ -301,10 +650,9 @@ public class Gin {
             if (body != null && body.size() > 0) {
                 context.outputStream.write(body.toByteArray());
             } else if (bodyInputStream != null) {
-                int c = 0;
-                while ((c = bodyInputStream.read()) != -1) {
-                    context.outputStream.write(c);
-                }
+                FileChannel fi = bodyInputStream.getChannel();
+                WritableByteChannel fo = Channels.newChannel(context.outputStream);
+                fi.transferTo(0, fi.size(), fo);
             }
 
             context.outputStream.write("\r\n\r\n".getBytes("UTF-8"));
@@ -369,11 +717,19 @@ public class Gin {
         }
 
         public void notFound() throws IOException {
-            string(Status.notFound, "404 not found");
+            htmlBody(Status.notFound, "404 not found");
+        }
+
+        public void forbidden() throws IOException {
+            htmlBody(Status.forbidden,"401 Forbidden");
+        }
+
+        public void badRequest(String err) throws IOException {
+            htmlBody(Status.badRequest, "400 Bad Request: " + err);
         }
 
         public void internalServerError(String err) throws IOException {
-            string(Status.internalServerError, "500 Internal Server Error: " + err);
+            htmlBody(Status.internalServerError, "500 Internal Server Error: " + err);
         }
     }
 
@@ -392,10 +748,12 @@ public class Gin {
 
     public static class Status {
         public static final int ok = 200;
+        public static final int badRequest = 400;
+        public static final int unauthorized = 401;
+        public static final int forbidden = 403;
         public static final int notFound = 404;
         public static final int methodNotAllowed = 405;
         public static final int internalServerError = 500;
-        public static final int badRequest = 400;
 
         public static String getMessage(int code) {
             switch (code) {
@@ -409,6 +767,10 @@ public class Gin {
                     return "Internal Server Error";
                 case badRequest:
                     return "Bad Request";
+                case forbidden:
+                    return "Forbidden";
+                case unauthorized:
+                    return "Unauthorized";
             }
             return "Unknown status";
         }
@@ -452,6 +814,16 @@ public class Gin {
     }
 
     public static class StrX {
+        public static String createQuery(Map<String, String> m) throws UnsupportedEncodingException {
+            StringBuilder s = new StringBuilder();
+            for (Map.Entry<String, String> entry : m.entrySet()) {
+                s.append("&").append(entry.getKey()).append("=").append(URLEncoder.encode(entry.getValue(), "UTF-8"));
+            }
+            if (s.length() == 0) {
+                return "";
+            }
+            return s.substring(1);
+        }
 
         public static boolean bytesEquals(byte[] a, byte[] b) {
             if (a == null) {
@@ -651,12 +1023,31 @@ public class Gin {
     }
 
     public static class FileX {
-        public static void truncateFile(String path) {
+        public static void truncateFile(String path) throws IOException {
             File file = new File(path);
             file.getParentFile().mkdirs();
             if (file.exists()) {
                 file.delete();
             }
+            file.createNewFile();
+        }
+
+        public static void copyFile(String dst, String src) throws IOException {
+            truncateFile(dst);
+            final FileInputStream inputStream = new FileInputStream(src);
+            final FileOutputStream outputStream = new FileOutputStream(dst);
+            final FileChannel inChannel = inputStream.getChannel();
+            final FileChannel outChannel = outputStream.getChannel();
+            inChannel.transferTo(0, inChannel.size(), outChannel);
+            inChannel.close();
+            outChannel.close();
+            inputStream.close();
+            outputStream.close();
+        }
+
+        public static void moveFile(String dst, String src) throws IOException {
+            copyFile(dst,src);
+            new File(src).delete();
         }
 
         public static String joinPath(String dir, String name) {
@@ -664,6 +1055,15 @@ public class Gin {
                 return dir + name;
             }
             return dir + "/" + name;
+        }
+
+        public static String extension(String path) {
+            String name = StrX.subAfterLast(path, "/", path);
+            String ext = StrX.subAfterLast(name, ".", "");
+            if (ext == null || ext.isEmpty()) {
+                return "";
+            }
+            return "." + ext;
         }
 
         public static String formatSize(long size) {
@@ -686,6 +1086,22 @@ public class Gin {
                 return String.format("%.2fK", f);
             }
             return size + "B";
+        }
+
+        public static String duplicateFileNameIfNeeded(String path) {
+            if (!new File(path).exists()) {
+                return path;
+            }
+            String dir = StrX.subBeforeLast(path, "/", "");
+            String filename = StrX.subAfterLast(path, "/", path);
+            filename = StrX.subBeforeLast(filename, ".", filename);
+            String ext = extension(path);
+            for (int i = 0; true; i++) {
+                String dst = joinPath(dir, filename + "-" + i + ext);
+                if (!new File(dst).exists()) {
+                    return dst;
+                }
+            }
         }
 
         public static String getMimeType(String s) {
@@ -833,6 +1249,41 @@ public class Gin {
                     return "text/plain";
             }
         }
+
+        public static void readInputStreamToFile(InputStream inputStream, long inputLength, String dst) throws IOException {
+            new File(StrX.subBeforeLast(dst, "/", "/")).mkdirs();
+            File file = new File(dst);
+            if (file.exists()) {
+                file.delete();
+            }
+            file.createNewFile();
+            FileOutputStream fileOutputStream = new FileOutputStream(file);
+            FileChannel fileChannel = fileOutputStream.getChannel();
+            ReadableByteChannel readableByteChannel = Channels.newChannel(inputStream);
+            fileChannel.transferFrom(readableByteChannel, 0, inputLength);
+            fileOutputStream.close();
+        }
+
+        public static void readInputStreamToFile(InputStream inputStream, String dst) throws IOException {
+            new File(StrX.subBeforeLast(dst, "/", "/")).mkdirs();
+            File file = new File(dst);
+            if (file.exists()) {
+                file.delete();
+            }
+            file.createNewFile();
+            FileOutputStream fileOutputStream = new FileOutputStream(file);
+            FileChannel fileChannel = fileOutputStream.getChannel();
+            ReadableByteChannel readableByteChannel = Channels.newChannel(inputStream);
+
+            ByteBuffer byteBuffer = ByteBuffer.allocate(4 << 10);
+            while (readableByteChannel.read(byteBuffer) > 0) {
+                byteBuffer.flip();
+                fileChannel.write(byteBuffer);
+            }
+
+            fileOutputStream.close();
+        }
+
     }
 
     public static class DSL {
@@ -868,6 +1319,23 @@ public class Gin {
                 attr("id", s);
                 return this;
             }
+
+            public Element style(String s) {
+                attr("style", s);
+                return this;
+            }
+
+            public Element onclick(String s) {
+                attr("onclick", s);
+                return this;
+            }
+
+            public Element onlyIf(boolean b) {
+                if (b) {
+                    return this;
+                }
+                return null;
+            }
         }
 
         public static class InnerText extends Element {
@@ -898,6 +1366,9 @@ public class Gin {
                 }
                 builder.append(">");
                 for (Element element : children) {
+                    if (element == null) {
+                        continue;
+                    }
                     builder.append(element.marshal());
                 }
                 builder.append("</").append(tagName).append(">");
@@ -909,11 +1380,33 @@ public class Gin {
                 return this;
             }
 
+            public <T> Container bodyListOfIndex(List<T> list, ElementTypeIndexHandler<T> handler) {
+                for (int i = 0; i < list.size(); i++) {
+                    children.add(handler.handle(list.get(i), i));
+                }
+                return this;
+            }
+
+            public <T> Container bodyListOf(List<T> list, ElementTypeHandler<T> handler) {
+                for (int i = 0; i < list.size(); i++) {
+                    children.add(handler.handle(list.get(i)));
+                }
+                return this;
+            }
+
             public Container setBody(Element... elements) {
                 children.clear();
                 children.addAll(Arrays.asList(elements));
                 return this;
             }
+        }
+
+        public interface ElementTypeIndexHandler<T> {
+            Element handle(T v, int pos);
+        }
+
+        public interface ElementTypeHandler<T> {
+            Element handle(T v);
         }
 
         public static class Html extends Container {
@@ -934,13 +1427,13 @@ public class Gin {
             public Head() {
                 super("head");
                 body(
-                        new Element("meta").attr("charset", "UTF-8"),
-                        new Element("meta").attr("name", "viewport").attr("content", "width=device-width, initial-scale=1.0")
+                    new Element("meta").attr("charset", "UTF-8"),
+                    new Element("meta").attr("name", "viewport").attr("content", "width=device-width, initial-scale=1.0")
                 );
             }
         }
 
-        public static class Form extends Container{
+        public static class Form extends Container {
 
             public Form() {
                 super("form");
@@ -966,11 +1459,33 @@ public class Gin {
                 return this;
             }
 
-            public Form encTypeUrlEncoded(){
+            public Form encTypeUrlEncoded() {
                 attr("enctype", "application/x-www-form-urlencoded");
                 return this;
             }
 
+        }
+
+        public static class ALink extends Container {
+            public ALink() {
+                super("a");
+            }
+
+            public ALink href(String link) {
+                attr("href", link);
+                return this;
+            }
+
+            public ALink targetBlank() {
+                attr("target", "_blank");
+                return this;
+            }
+        }
+
+        public ALink a(Element... elements) {
+            ALink v = new ALink();
+            v.body(elements);
+            return v;
         }
 
         public Form form(Element... elements) {
@@ -983,6 +1498,17 @@ public class Gin {
             Html v = new Html();
             v.body(elements);
             return v;
+        }
+
+        public Html htmlAutoBody(Element... elements) {
+//            html(code, "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Information</title></head><body>" + s + "</body></html>");
+            return html(
+                head(
+                    meta().attr("charset", "UTF-8"),
+                    meta().attr("name", "viewport").attr("content", "width=device-width,initial-scale=1")
+                ),
+                body(elements)
+            );
         }
 
         public Container head(Element... elements) {
@@ -1017,6 +1543,12 @@ public class Gin {
             return new Container("script").body(new InnerText(js));
         }
 
+        public Container scriptSrc(String src) {
+            Container v = new Container("script");
+            v.attr("src", src);
+            return v;
+        }
+
         public Container span(Element... elements) {
             return new Container("span").body(elements);
         }
@@ -1025,6 +1557,11 @@ public class Gin {
 
             public Input() {
                 super("input");
+            }
+
+            public Input name(String s) {
+                attr("name", s);
+                return this;
             }
 
             public Input value(String v) {
@@ -1037,19 +1574,28 @@ public class Gin {
                 return this;
             }
 
+            public Input multiple() {
+                attr("multiple", "multiple");
+                return this;
+            }
         }
 
         private Input input() {
             return new Input();
         }
 
-        public Element inputText() {
+        public Input inputText() {
             return input().type("text");
         }
 
-        public Input inputSubmit(){
+        public Input inputFile() {
+            return input().type("file");
+        }
+
+        public Input inputSubmit() {
             return input().type("submit").value("submit");
         }
+
         public Element inputPassword() {
             return input().type("password");
         }
@@ -1082,5 +1628,118 @@ public class Gin {
             return new Container("h5").body(text(s));
         }
 
+        public Container ul(Element... elements) {
+            return new Container("ul").body(elements);
+        }
+
+        public Container ol(Element... elements) {
+            return new Container("ol").body(elements);
+        }
+
+        public Container li(Element... elements) {
+            return new Container("li").body(elements);
+        }
+
+        public Container p(Element... elements) {
+            return new Container("p").body(elements);
+        }
+
+        public Container nav(Element... elements) {
+            return new Container("nav").body(elements);
+        }
+
+        public static class Progress extends Container {
+
+            public Progress() {
+                super("progress");
+            }
+
+            public Progress max(int i) {
+                attr("max", String.valueOf(i));
+                return this;
+            }
+
+            public Progress value(int i) {
+                attr("value", String.valueOf(i));
+                return this;
+            }
+        }
+
+        public Progress progress() {
+            return new Progress();
+        }
+
+        public Element br() {
+            return new Element("br");
+        }
+
+        public Element hr() {
+            return new Element("hr");
+        }
+
+        public static class TextArea extends Container {
+
+            public TextArea() {
+                super("textarea");
+            }
+
+            public TextArea name(String s) {
+                attr("name", s);
+                return this;
+            }
+
+            public TextArea cols(int i) {
+                attr("cols", String.valueOf(i));
+                return this;
+            }
+
+            public TextArea rows(int i) {
+                attr("rows", String.valueOf(i));
+                return this;
+            }
+        }
+
+        public TextArea textArea() {
+            return new TextArea();
+        }
     }
+
+
+    public static class NetX {
+        public static List<String> getIPs(boolean ipv6) throws SocketException {
+            List<String> list = new ArrayList<>();
+            List<String> listV6 = new ArrayList<>();
+
+            Enumeration<NetworkInterface> networkInterfaces = NetworkInterface.getNetworkInterfaces();
+            while (networkInterfaces.hasMoreElements()) {
+                NetworkInterface networkInterface = networkInterfaces.nextElement();
+                Enumeration<InetAddress> inetAddresses = networkInterface.getInetAddresses();
+                while (inetAddresses.hasMoreElements()) {
+                    InetAddress inetAddress = inetAddresses.nextElement();
+                    if (inetAddress.isLoopbackAddress()) {
+                        continue;
+                    }
+                    String hostAddress = inetAddress.getHostAddress();
+                    if (hostAddress == null) {
+                        continue;
+                    }
+                    if (hostAddress.contains(":")) {
+                        //ipv6
+                        int delimit = hostAddress.indexOf('%'); // drop ip6 zone suffix}
+                        String s = delimit < 0 ? hostAddress.toUpperCase() : hostAddress.substring(0, delimit).toUpperCase();
+                        listV6.add(s);
+                    } else {
+                        //ipv4
+                        list.add(hostAddress);
+                    }
+                }
+            }
+            if (ipv6) {
+                list.addAll(listV6);
+            }
+
+            return list;
+        }
+    }
+
 }
